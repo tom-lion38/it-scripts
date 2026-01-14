@@ -1,11 +1,11 @@
 # wireguard-server-autosetup.ps1
 # WireGuard SERVER auto-install + config on Windows (10/11/Server).
 # - Installe WireGuard (winget -> MSI fallback)
-# - Crée un tunnel wg0 (serveur) en service Windows
+# - Crée un tunnel serveur (wg0) en service Windows
 # - Ouvre le port UDP
 # - Active le routage IPv4
-# - (Optionnel) Configure WinNAT (New-NetNat) pour "full-tunnel" (clients -> Internet via le serveur)
-# - Génère 1+ configs clients
+# - (Optionnel) Configure WinNAT (New-NetNat) pour full-tunnel (clients -> Internet via le serveur)
+# - Génère 1+ configs clients et ajoute automatiquement les peers côté serveur
 #
 # Run (PowerShell Admin):
 #   chcp 65001 | Out-Null
@@ -15,7 +15,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# UTF-8 console output (évite les "Ã©")
+# UTF-8 output to avoid mojibake (Ã© etc.)
 try {
   chcp 65001 | Out-Null
   $OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
@@ -108,11 +108,41 @@ function Get-WireGuardPaths {
   return @{ wg = $wgExe; wireguard = $wgui }
 }
 
+# Avoid PowerShell pipeline for pubkey conversion (fixes: "Trailing characters found after key")
+function Get-WgPubKeyFromPriv([string]$wgExe, [string]$PrivKey) {
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $wgExe
+  $psi.Arguments = "pubkey"
+  $psi.RedirectStandardInput = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+
+  $p = New-Object System.Diagnostics.Process
+  $p.StartInfo = $psi
+  [void]$p.Start()
+
+  $p.StandardInput.WriteLine($PrivKey.Trim())
+  $p.StandardInput.Close()
+
+  $out = $p.StandardOutput.ReadToEnd()
+  $err = $p.StandardError.ReadToEnd()
+  $p.WaitForExit()
+
+  if ($p.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($out)) {
+    Die "wg pubkey a échoué. $err"
+  }
+  return $out.Trim()
+}
+
 function New-WgKeyPair([string]$wgExe) {
-  $priv = (& $wgExe genkey).Trim()
+  $priv = (& $wgExe genkey 2>$null).Trim()
   if ([string]::IsNullOrWhiteSpace($priv)) { Die "Échec gen clé privée." }
-  $pub = ($priv | & $wgExe pubkey).Trim()
+
+  $pub = Get-WgPubKeyFromPriv -wgExe $wgExe -PrivKey $priv
   if ([string]::IsNullOrWhiteSpace($pub)) { Die "Échec gen clé publique." }
+
   return @{ Private=$priv; Public=$pub }
 }
 
@@ -146,7 +176,8 @@ function Ensure-FirewallRuleUdp([int]$Port) {
 
 function Enable-IPForwarding {
   Info "Activation routage IPv4 (IPEnableRouter=1)…"
-  New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "IPEnableRouter" -PropertyType DWord -Value 1 -Force | Out-Null
+  New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" `
+    -Name "IPEnableRouter" -PropertyType DWord -Value 1 -Force | Out-Null
   Ok "Routage IPv4 activé (registry)."
 }
 
@@ -187,7 +218,10 @@ function Append-PeerToServer([string]$Path,[string]$ClientPub,[string]$ClientIP3
   Add-Content -Path $Path -Value "`r`n[Peer]`r`nPublicKey = $ClientPub`r`nAllowedIPs = $ClientIP32" -Encoding ASCII
 }
 
-function Write-ClientConfig([string]$Path,[string]$ClientPriv,[string]$ClientIP,[string]$Dns,[string]$ServerPub,[string]$Endpoint,[int]$Port,[string]$Allowed,[int]$Keepalive) {
+function Write-ClientConfig(
+  [string]$Path,[string]$ClientPriv,[string]$ClientIP,[string]$Dns,
+  [string]$ServerPub,[string]$Endpoint,[int]$Port,[string]$Allowed,[int]$Keepalive
+) {
   $dir = Split-Path -Parent $Path
   if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
   $content = @"
@@ -198,7 +232,7 @@ DNS = $Dns
 
 [Peer]
 PublicKey = $ServerPub
-Endpoint = $Endpoint`:$Port
+Endpoint = ${Endpoint}:$Port
 AllowedIPs = $Allowed
 PersistentKeepalive = $Keepalive
 "@
@@ -220,7 +254,7 @@ function Restart-TunnelService([string]$TunnelName) {
     Restart-Service -Name $svc -Force
     Ok "Service redémarré: $svc"
   } catch {
-    Warn "Impossible de redémarrer $svc automatiquement (ok si c’est le 1er démarrage)."
+    Warn "Impossible de redémarrer $svc automatiquement."
   }
 }
 
@@ -246,11 +280,14 @@ $wgExe = $paths.wg
 $wgui  = $paths.wireguard
 Ok "WireGuard présent: $wgui"
 
-# Choix interface WAN (pour IP par défaut / contexte)
-$ifcs = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq "Up" -and $_.IPv4Address }
-if (-not $ifcs) { Warn "Aucune interface avec gateway trouvée. Continue quand même." }
+# Pick WAN interface (for default IP hint)
+$ifcs = Get-NetIPConfiguration | Where-Object {
+  $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq "Up" -and $_.IPv4Address
+}
 $pick = if ($ifcs) {
-  Select-FromList "Choisis l'interface WAN (celle qui sort Internet/LAN principal)" $ifcs { param($x) "$($x.InterfaceAlias)  |  $($x.IPv4Address.IPAddress)" }
+  Select-FromList "Choisis l'interface WAN (celle qui sort Internet/LAN principal)" $ifcs {
+    param($x) "$($x.InterfaceAlias)  |  $($x.IPv4Address.IPAddress)"
+  }
 } else { $null }
 $defaultIP = if ($pick) { $pick.IPv4Address.IPAddress } else { "" }
 
@@ -265,7 +302,9 @@ if ($portRaw -notmatch '^\d+$') { Die "Port invalide." }
 $listenPort = [int]$portRaw
 
 $cidr = Read-Default "Réseau WireGuard (CIDR /24 recommandé)" "10.8.0.0/24"
-if ($cidr -notmatch '^(\d{1,3}\.){3}\d{1,3}/24$') { Die "Ce script gère automatiquement /24 uniquement (ex: 10.8.0.0/24)." }
+if ($cidr -notmatch '^(\d{1,3}\.){3}\d{1,3}/24$') {
+  Die "Ce script gère automatiquement /24 uniquement (ex: 10.8.0.0/24)."
+}
 
 $baseIP = $cidr.Split('/')[0]
 $basePrefix = ($baseIP -split '\.')[0..2] -join '.'
@@ -286,7 +325,9 @@ switch ($dnsChoice) {
   "2" { $dns="8.8.8.8" }
   "3" { $dns="9.9.9.9" }
   "4" {
-    $dns = (Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $_.ServerAddresses } | Select-Object -First 1).ServerAddresses[0]
+    $dns = (Get-DnsClientServerAddress -AddressFamily IPv4 |
+      Where-Object { $_.ServerAddresses } |
+      Select-Object -First 1).ServerAddresses[0]
     if ([string]::IsNullOrWhiteSpace($dns)) { $dns="1.1.1.1" }
   }
 }
@@ -294,15 +335,15 @@ switch ($dnsChoice) {
 # Routing mode for clients
 Write-Host ""
 Write-Host "Mode de routage client :" -ForegroundColor Cyan
-Write-Host "  1) Full-tunnel (tout passe dans le VPN)     AllowedIPs=0.0.0.0/0"
-Write-Host "  2) Split-tunnel (seulement réseaux choisis) AllowedIPs=ex: 10.8.0.0/24,192.168.1.0/24"
+Write-Host "  1) Full-tunnel (tout passe dans le VPN)      AllowedIPs=0.0.0.0/0"
+Write-Host "  2) Split-tunnel (réseaux choisis)           AllowedIPs=ex: 10.8.0.0/24,192.168.1.0/24"
 $routeMode = Read-Default "Ton choix" "1"
 $clientAllowed = "0.0.0.0/0"
 if ($routeMode -eq "2") {
   $clientAllowed = Read-Default "AllowedIPs (séparés par virgules)" "$cidr"
 }
 
-# NAT option (pour full-tunnel Internet)
+# NAT option (for full-tunnel Internet)
 $doNat = $false
 if ($routeMode -eq "1") {
   $doNat = Read-YesNo "Configurer WinNAT pour que les clients aient Internet via ce serveur ?" "y"
@@ -313,7 +354,7 @@ if ($routeMode -eq "1") {
 Write-Host ""
 Info "Résumé :"
 Write-Host "  Tunnel     : $tunnelName"
-Write-Host "  Endpoint   : $endpoint:$listenPort/udp"
+Write-Host "  Endpoint   : ${endpoint}:$listenPort/udp"
 Write-Host "  WG réseau  : $cidr (serveur: $serverIP)"
 Write-Host "  DNS client : $dns"
 Write-Host "  AllowedIPs : $clientAllowed"
@@ -345,7 +386,7 @@ Ok "Config serveur écrite."
 Ensure-FirewallRuleUdp -Port $listenPort
 Enable-IPForwarding
 
-# WinNAT (optionnel)
+# WinNAT (optional)
 if ($doNat) {
   $natName = "WireGuardNAT-$tunnelName"
   [void](Try-Configure-WinNAT -NatName $natName -InternalPrefix $cidr)
@@ -363,7 +404,7 @@ $startOctet = 2
 $keepalive = 25
 
 while ($true) {
-  $clientName = Read-Default "Nom du client (ex: phone1) ou vide pour finir" "client1"
+  $clientName = Read-Host "Nom du client (ex: phone1) ou ENTER pour finir"
   if ([string]::IsNullOrWhiteSpace($clientName)) { break }
   if ($clientName -notmatch '^[a-zA-Z0-9._-]+$') { Write-Host "Nom invalide."; continue }
 
@@ -377,7 +418,7 @@ while ($true) {
 
   Info "Génération clés client…"
   $ckp = New-WgKeyPair -wgExe $wgExe
-  Ok "Clé publique CLIENT (à ajouter serveur):"
+  Ok "Clé publique CLIENT (peer côté serveur):"
   Write-Host $ckp.Public
 
   Append-PeerToServer -Path $serverConf -ClientPub $ckp.Public -ClientIP32 "$clientIP/32"
@@ -391,12 +432,13 @@ while ($true) {
   if (-not (Read-YesNo "Ajouter un autre client ?" "y")) { break }
 }
 
-# Restart tunnel to load new peers
+# Reload peers
 Restart-TunnelService -TunnelName $tunnelName
 
 Write-Host ""
 Ok "Terminé."
-Info "Config serveur: $serverConf"
+Info "Config serveur : $serverConf"
 Info "Configs clients: $clientsDir\*.conf"
-Info "Voir état: `"$wgExe`" show"
-Info "Service: WireGuardTunnel`$$tunnelName"
+Info "Voir état      : `"$wgExe`" show"
+Info "Service        : WireGuardTunnel`$$tunnelName"
+Info "Logs WG        : `"$wgui`" /dumplog"
