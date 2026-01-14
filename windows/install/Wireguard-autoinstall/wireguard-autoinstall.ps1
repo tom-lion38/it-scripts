@@ -1,12 +1,4 @@
-# wireguard-autoinstall.ps1 (v2)
-# Windows WireGuard auto-install + tunnel service.
-# Nouveauté v2: récupération "auto" de la clé publique du serveur si elle est disponible localement
-# (interfaces WireGuard déjà présentes) OU via URL/fichier.
-#
-# Run (PowerShell admin):
-#   Set-ExecutionPolicy Bypass -Scope Process -Force
-#   .\wireguard-autoinstall.ps1
-
+# wireguard-autoinstall.ps1 (v3 - fix Count/StrictMode)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
@@ -106,18 +98,19 @@ function New-WgKeyPair([string]$wgExe) {
 }
 
 function Select-FromList([string]$Title, [string[]]$Items) {
-  if (-not $Items -or $Items.Count -eq 0) { return $null }
+  $arr = @($Items) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  if ($arr.Length -eq 0) { return $null }
+
   Write-Host ""
   Write-Host $Title -ForegroundColor Cyan
-  for ($i=0; $i -lt $Items.Count; $i++) {
-    Write-Host ("  {0}) {1}" -f ($i+1), $Items[$i])
-  }
+  for ($i=0; $i -lt $arr.Length; $i++) { Write-Host ("  {0}) {1}" -f ($i+1), $arr[$i]) }
+
   while ($true) {
-    $raw = Read-Host "Choix (1-$($Items.Count)) ou vide pour annuler"
+    $raw = Read-Host "Choix (1-$($arr.Length)) ou vide pour annuler"
     if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
     if ($raw -match '^\d+$') {
       $n = [int]$raw
-      if ($n -ge 1 -and $n -le $Items.Count) { return $Items[$n-1] }
+      if ($n -ge 1 -and $n -le $arr.Length) { return $arr[$n-1] }
     }
     Write-Host "Choix invalide."
   }
@@ -127,20 +120,17 @@ function Get-LocalWgInterfaces([string]$wgExe) {
   try {
     $out = (& $wgExe show interfaces 2>$null)
     if ([string]::IsNullOrWhiteSpace($out)) { return @() }
-    return ($out -split '\s+') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    # Force array
+    return @($out -split '\s+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
   } catch {
     return @()
   }
 }
 
-function Try-GetServerPubKeyAuto {
-  param(
-    [string]$wgExe
-  )
-
-  # Option 1: si un tunnel WireGuard existe sur ce PC, on peut récupérer sa public key
-  $ifaces = Get-LocalWgInterfaces -wgExe $wgExe
-  if ($ifaces.Count -gt 0) {
+function Try-GetServerPubKeyAuto([string]$wgExe) {
+  # 1) Interface WireGuard locale -> public key
+  $ifaces = @(Get-LocalWgInterfaces -wgExe $wgExe)
+  if ($ifaces.Length -gt 0) {
     $picked = Select-FromList -Title "Interfaces WireGuard locales détectées (clé publique récupérable automatiquement)" -Items $ifaces
     if ($picked) {
       try {
@@ -153,32 +143,22 @@ function Try-GetServerPubKeyAuto {
     }
   }
 
-  # Option 2: URL texte brut (ex: https://tondomaine.tld/wg-server.pub)
-  $url = Read-Default "URL (optionnelle) de la clé publique serveur (texte brut) - vide pour passer" ""
+  # 2) URL texte brut
+  $url = Read-Default "URL (optionnelle) clé publique serveur (texte brut) - vide pour passer" ""
   if (-not [string]::IsNullOrWhiteSpace($url)) {
     try {
       $pk = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content.Trim()
-      if (-not [string]::IsNullOrWhiteSpace($pk)) {
-        Write-Ok "Clé publique récupérée via URL."
-        return $pk
-      }
-    } catch {
-      Write-Warn "Impossible de récupérer via URL: $($_.Exception.Message)"
-    }
+      if (-not [string]::IsNullOrWhiteSpace($pk)) { Write-Ok "Clé publique récupérée via URL."; return $pk }
+    } catch { Write-Warn "URL KO: $($_.Exception.Message)" }
   }
 
-  # Option 3: fichier local
+  # 3) fichier local
   $path = Read-Default "Fichier (optionnel) contenant la clé publique serveur - vide pour passer" ""
   if (-not [string]::IsNullOrWhiteSpace($path)) {
     if (Test-Path $path) {
       $pk = (Get-Content -Path $path -Raw).Trim()
-      if (-not [string]::IsNullOrWhiteSpace($pk)) {
-        Write-Ok "Clé publique récupérée via fichier."
-        return $pk
-      }
-    } else {
-      Write-Warn "Fichier introuvable: $path"
-    }
+      if (-not [string]::IsNullOrWhiteSpace($pk)) { Write-Ok "Clé publique récupérée via fichier."; return $pk }
+    } else { Write-Warn "Fichier introuvable: $path" }
   }
 
   return $null
@@ -222,13 +202,10 @@ function Install-TunnelService([string]$wireguardExe, [string]$confPath, [string
   Write-Ok "Tunnel installé. Service: $svc"
 }
 
-# ------------------
 # MAIN
-# ------------------
 if (-not (Test-Admin)) { Die "Lance PowerShell en Administrateur." }
 
 Write-Info "WireGuard auto-install (Windows)"
-
 $installed = Install-WireGuard-WithWinget
 if (-not $installed) { $installed = Install-WireGuard-WithMSI }
 if (-not $installed) { Die "Installation WireGuard impossible." }
@@ -243,7 +220,6 @@ if (-not (Read-YesNo "Créer et installer un tunnel WireGuard maintenant ?" "y")
   exit 0
 }
 
-# Tunnel prompts
 $tunnelName   = Read-Default "Nom du tunnel (service)" "wg0"
 if ($tunnelName -notmatch '^[a-zA-Z0-9._-]+$') { Die "Nom tunnel invalide (lettres/chiffres/._-)." }
 
@@ -253,7 +229,6 @@ if ([string]::IsNullOrWhiteSpace($endpointHost)) { Die "Endpoint vide." }
 $endpointPort = Read-Default "Port WireGuard UDP" "51820"
 if ($endpointPort -notmatch '^\d+$') { Die "Port invalide." }
 
-# SERVER PUBKEY: auto if possible
 Write-Info "Récupération de la clé publique serveur (auto si possible)…"
 $serverPubKey = Try-GetServerPubKeyAuto -wgExe $wgExe
 if ([string]::IsNullOrWhiteSpace($serverPubKey)) {
