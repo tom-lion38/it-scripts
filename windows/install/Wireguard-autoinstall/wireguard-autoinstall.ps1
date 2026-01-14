@@ -1,15 +1,11 @@
-# wireguard-autoinstall.ps1
-# Installe WireGuard sur Windows (silencieux) puis (optionnel) crée/import un tunnel en service.
-# - Méthode 1: winget si dispo
-# - Méthode 2: télécharge le MSI officiel depuis download.wireguard.com et installe via msiexec
+# wireguard-autoinstall.ps1 (v2)
+# Windows WireGuard auto-install + tunnel service.
+# Nouveauté v2: récupération "auto" de la clé publique du serveur si elle est disponible localement
+# (interfaces WireGuard déjà présentes) OU via URL/fichier.
 #
 # Run (PowerShell admin):
 #   Set-ExecutionPolicy Bypass -Scope Process -Force
 #   .\wireguard-autoinstall.ps1
-#
-# Notes:
-# - Ce script configure un "client" WireGuard (tunnel). Il ne configure pas un serveur WireGuard côté distant.
-# - Aucune info perso codée en dur: tout est demandé au runtime.
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -26,9 +22,7 @@ function Test-Admin {
 }
 
 function Read-Default([string]$Prompt, [string]$Default = "") {
-  if ([string]::IsNullOrWhiteSpace($Default)) {
-    return (Read-Host $Prompt)
-  }
+  if ([string]::IsNullOrWhiteSpace($Default)) { return (Read-Host $Prompt) }
   $v = Read-Host "$Prompt [$Default]"
   if ([string]::IsNullOrWhiteSpace($v)) { return $Default }
   return $v
@@ -47,7 +41,6 @@ function Read-YesNo([string]$Prompt, [string]$Default = "y") {
 }
 
 function Get-ArchTag {
-  # WireGuard MSIs on download page: amd64 / arm64 / x86
   switch ($env:PROCESSOR_ARCHITECTURE) {
     "AMD64" { return "amd64" }
     "ARM64" { return "arm64" }
@@ -63,10 +56,7 @@ function Install-WireGuard-WithWinget {
     "install","-e","--id","WireGuard.WireGuard",
     "--accept-package-agreements","--accept-source-agreements"
   ) -Wait -PassThru -WindowStyle Hidden
-  if ($p.ExitCode -eq 0) {
-    Write-Ok "WireGuard installé (winget)."
-    return $true
-  }
+  if ($p.ExitCode -eq 0) { Write-Ok "WireGuard installé (winget)."; return $true }
   Write-Warn "winget a échoué (code $($p.ExitCode)). Fallback MSI…"
   return $false
 }
@@ -77,12 +67,10 @@ function Install-WireGuard-WithMSI {
   Write-Info "Récupération de la liste officielle des MSIs…"
   $html = (Invoke-WebRequest -Uri $base -UseBasicParsing).Content
 
-  # Trouve le dernier MSI correspondant à l'arch: wireguard-amd64-0.x.y.msi
   $regex = "wireguard-$arch-([0-9]+\.[0-9]+\.[0-9]+)\.msi"
   $matches = [regex]::Matches($html, $regex)
   if ($matches.Count -lt 1) { Die "Impossible de trouver un MSI WireGuard pour arch=$arch sur $base" }
 
-  # Sur la page, il n'y a normalement qu'une version "courante"; on prend la dernière matchée.
   $ver = $matches[$matches.Count - 1].Groups[1].Value
   $msiName = "wireguard-$arch-$ver.msi"
   $msiUrl  = $base + $msiName
@@ -94,7 +82,6 @@ function Install-WireGuard-WithMSI {
   Write-Ok "MSI téléchargé: $msiPath"
 
   Write-Info "Installation silencieuse (msiexec)…"
-  # DO_NOT_LAUNCH=1 évite l'ouverture UI après install (propriété MSI WireGuard)
   $args = "/i `"$msiPath`" /qn DO_NOT_LAUNCH=1"
   $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
   if ($p.ExitCode -ne 0) { Die "msiexec a échoué (code $($p.ExitCode))." }
@@ -105,18 +92,96 @@ function Install-WireGuard-WithMSI {
 function Get-WireGuardPaths {
   $wgExe = Join-Path $env:ProgramFiles "WireGuard\wg.exe"
   $wgui  = Join-Path $env:ProgramFiles "WireGuard\wireguard.exe"
-  if (-not (Test-Path $wgExe)) { Die "wg.exe introuvable: $wgExe (install WireGuard KO ?)" }
-  if (-not (Test-Path $wgui))  { Die "wireguard.exe introuvable: $wgui (install WireGuard KO ?)" }
+  if (-not (Test-Path $wgExe)) { Die "wg.exe introuvable: $wgExe" }
+  if (-not (Test-Path $wgui))  { Die "wireguard.exe introuvable: $wgui" }
   return @{ wg = $wgExe; wireguard = $wgui }
 }
 
 function New-WgKeyPair([string]$wgExe) {
-  # wg genkey | wg pubkey
   $priv = (& $wgExe genkey).Trim()
   if ([string]::IsNullOrWhiteSpace($priv)) { Die "Échec génération clé privée." }
   $pub  = ($priv | & $wgExe pubkey).Trim()
   if ([string]::IsNullOrWhiteSpace($pub)) { Die "Échec génération clé publique." }
   return @{ Private = $priv; Public = $pub }
+}
+
+function Select-FromList([string]$Title, [string[]]$Items) {
+  if (-not $Items -or $Items.Count -eq 0) { return $null }
+  Write-Host ""
+  Write-Host $Title -ForegroundColor Cyan
+  for ($i=0; $i -lt $Items.Count; $i++) {
+    Write-Host ("  {0}) {1}" -f ($i+1), $Items[$i])
+  }
+  while ($true) {
+    $raw = Read-Host "Choix (1-$($Items.Count)) ou vide pour annuler"
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    if ($raw -match '^\d+$') {
+      $n = [int]$raw
+      if ($n -ge 1 -and $n -le $Items.Count) { return $Items[$n-1] }
+    }
+    Write-Host "Choix invalide."
+  }
+}
+
+function Get-LocalWgInterfaces([string]$wgExe) {
+  try {
+    $out = (& $wgExe show interfaces 2>$null)
+    if ([string]::IsNullOrWhiteSpace($out)) { return @() }
+    return ($out -split '\s+') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  } catch {
+    return @()
+  }
+}
+
+function Try-GetServerPubKeyAuto {
+  param(
+    [string]$wgExe
+  )
+
+  # Option 1: si un tunnel WireGuard existe sur ce PC, on peut récupérer sa public key
+  $ifaces = Get-LocalWgInterfaces -wgExe $wgExe
+  if ($ifaces.Count -gt 0) {
+    $picked = Select-FromList -Title "Interfaces WireGuard locales détectées (clé publique récupérable automatiquement)" -Items $ifaces
+    if ($picked) {
+      try {
+        $pk = (& $wgExe show $picked public-key 2>$null).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($pk)) {
+          Write-Ok "Clé publique récupérée depuis l'interface locale: $picked"
+          return $pk
+        }
+      } catch { }
+    }
+  }
+
+  # Option 2: URL texte brut (ex: https://tondomaine.tld/wg-server.pub)
+  $url = Read-Default "URL (optionnelle) de la clé publique serveur (texte brut) - vide pour passer" ""
+  if (-not [string]::IsNullOrWhiteSpace($url)) {
+    try {
+      $pk = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content.Trim()
+      if (-not [string]::IsNullOrWhiteSpace($pk)) {
+        Write-Ok "Clé publique récupérée via URL."
+        return $pk
+      }
+    } catch {
+      Write-Warn "Impossible de récupérer via URL: $($_.Exception.Message)"
+    }
+  }
+
+  # Option 3: fichier local
+  $path = Read-Default "Fichier (optionnel) contenant la clé publique serveur - vide pour passer" ""
+  if (-not [string]::IsNullOrWhiteSpace($path)) {
+    if (Test-Path $path) {
+      $pk = (Get-Content -Path $path -Raw).Trim()
+      if (-not [string]::IsNullOrWhiteSpace($pk)) {
+        Write-Ok "Clé publique récupérée via fichier."
+        return $pk
+      }
+    } else {
+      Write-Warn "Fichier introuvable: $path"
+    }
+  }
+
+  return $null
 }
 
 function Write-ClientConfig {
@@ -153,9 +218,7 @@ function Install-TunnelService([string]$wireguardExe, [string]$confPath, [string
   & $wireguardExe /installtunnelservice $confPath | Out-Null
   Start-Sleep -Milliseconds 300
   $svc = "WireGuardTunnel`$$tunnelName"
-  try {
-    Start-Service -Name $svc -ErrorAction SilentlyContinue
-  } catch { }
+  try { Start-Service -Name $svc -ErrorAction SilentlyContinue } catch { }
   Write-Ok "Tunnel installé. Service: $svc"
 }
 
@@ -180,7 +243,7 @@ if (-not (Read-YesNo "Créer et installer un tunnel WireGuard maintenant ?" "y")
   exit 0
 }
 
-# Prompts tunnel
+# Tunnel prompts
 $tunnelName   = Read-Default "Nom du tunnel (service)" "wg0"
 if ($tunnelName -notmatch '^[a-zA-Z0-9._-]+$') { Die "Nom tunnel invalide (lettres/chiffres/._-)." }
 
@@ -190,12 +253,17 @@ if ([string]::IsNullOrWhiteSpace($endpointHost)) { Die "Endpoint vide." }
 $endpointPort = Read-Default "Port WireGuard UDP" "51820"
 if ($endpointPort -notmatch '^\d+$') { Die "Port invalide." }
 
-$serverPubKey = Read-Default "Clé publique du serveur (PublicKey)" ""
-if ([string]::IsNullOrWhiteSpace($serverPubKey)) { Die "Clé publique serveur vide." }
+# SERVER PUBKEY: auto if possible
+Write-Info "Récupération de la clé publique serveur (auto si possible)…"
+$serverPubKey = Try-GetServerPubKeyAuto -wgExe $wgExe
+if ([string]::IsNullOrWhiteSpace($serverPubKey)) {
+  $serverPubKey = Read-Default "Clé publique du serveur (PublicKey) à coller (fallback manuel)" ""
+}
+if ([string]::IsNullOrWhiteSpace($serverPubKey)) { Die "Clé publique serveur absente." }
 
 $clientAddr   = Read-Default "Adresse client (ex: 10.8.0.2/32)" "10.8.0.2/32"
 $dns          = Read-Default "DNS pour le client (ex: 1.1.1.1)" "1.1.1.1"
-$allowedIPs   = Read-Default "AllowedIPs (0.0.0.0/0 = full-tunnel, ou 10.8.0.0/24 = split)" "0.0.0.0/0"
+$allowedIPs   = Read-Default "AllowedIPs (0.0.0.0/0=full, ou 10.8.0.0/24=split)" "0.0.0.0/0"
 $keepalive    = Read-Default "PersistentKeepalive (sec)" "25"
 
 Write-Info "Génération clés client…"
