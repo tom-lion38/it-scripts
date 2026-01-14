@@ -1,5 +1,8 @@
 # WireGuard SERVER sur Windows — Auto-install + configuration (PowerShell)
 
+> [!WARNING]
+> **ATTENTION : ce script n'est pas fonctionnel à 100 %. Je travaille actuellement sur la correction des erreurs, mais cela prend du temps. Si vous trouvez des solutions, merci de me le dire.**
+
 Ce repo fournit un script PowerShell qui installe et configure **WireGuard en mode serveur** sur Windows, puis génère des **configs clients prêtes à importer**.
 
 L’objectif : tu lances le script en admin → tu réponds à quelques prompts → tu repars avec :
