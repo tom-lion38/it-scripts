@@ -1,10 +1,11 @@
-# wireguard-server-autosetup.ps1 (v3 - Windows SERVER)
-# - Installs WireGuard (winget -> MSI fallback)
-# - Creates a SERVER tunnel as a Windows service
-# - Opens UDP port in Windows Firewall
-# - Enables IPv4 routing
-# - Optional WinNAT for full-tunnel Internet
-# - Generates client configs and appends peers to server config
+# wireguard-server-autosetup.ps1 (v4 - Windows-proof)
+# WireGuard SERVER auto-install + config on Windows (10/11/Server).
+# - Installe WireGuard (winget -> MSI fallback)
+# - Crée un tunnel serveur (service Windows)
+# - Ouvre UDP port dans Firewall
+# - Active IPv4 routing
+# - (Optionnel) WinNAT pour full-tunnel Internet
+# - Génère configs clients + ajoute peers automatiquement
 #
 # Run (Admin):
 #   chcp 65001 | Out-Null
@@ -14,10 +15,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-try {
-  chcp 65001 | Out-Null
-  $OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
-} catch {}
+try { chcp 65001 | Out-Null } catch {}
 
 function Info($m){ Write-Host "[INFO] $m" -ForegroundColor Cyan }
 function Ok($m){   Write-Host "[OK]   $m" -ForegroundColor Green }
@@ -106,47 +104,46 @@ function Get-WireGuardPaths {
   return @{ wg = $wgExe; wireguard = $wgui }
 }
 
-function Invoke-ExeCapture {
-  param([string]$File,[string]$Args)
-  $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = $File
-  $psi.Arguments = $Args
-  $psi.RedirectStandardOutput = $true
-  $psi.RedirectStandardError  = $true
-  $psi.UseShellExecute = $false
-  $psi.CreateNoWindow = $true
-  $p = New-Object System.Diagnostics.Process
-  $p.StartInfo = $psi
-  [void]$p.Start()
-  $out = $p.StandardOutput.ReadToEnd()
-  $err = $p.StandardError.ReadToEnd()
-  $p.WaitForExit()
-  return [pscustomobject]@{ ExitCode=$p.ExitCode; StdOut=$out; StdErr=$err }
-}
-
 function Extract-WgKey([string]$Text) {
   $m = [regex]::Match($Text, '([A-Za-z0-9+/]{43}=)')
   if ($m.Success) { return $m.Groups[1].Value }
   return $null
 }
 
-# Most reliable on Windows: write key to temp file, run `type file | wg pubkey`
+function CmdOut([string]$cmdline) {
+  # Exécute via cmd.exe et récupère stdout+stderr de façon simple.
+  $p = New-Object System.Diagnostics.ProcessStartInfo
+  $p.FileName = "cmd.exe"
+  $p.Arguments = "/c $cmdline"
+  $p.RedirectStandardOutput = $true
+  $p.RedirectStandardError  = $true
+  $p.UseShellExecute = $false
+  $p.CreateNoWindow = $true
+
+  $proc = New-Object System.Diagnostics.Process
+  $proc.StartInfo = $p
+  [void]$proc.Start()
+  $out = $proc.StandardOutput.ReadToEnd()
+  $err = $proc.StandardError.ReadToEnd()
+  $proc.WaitForExit()
+
+  return [pscustomobject]@{ ExitCode=$proc.ExitCode; Out=$out; Err=$err }
+}
+
 function Get-WgPubKeyFromPriv_File([string]$wgExe, [string]$PrivKey) {
   $tmp = Join-Path $env:TEMP ("wg-priv-" + [guid]::NewGuid().ToString("N") + ".txt")
   try {
-    # Ensure ASCII, exactly the 44 chars + newline
     $key = $PrivKey.Trim()
     if ($key.Length -ne 44) { Die "Clé privée inattendue (len=$($key.Length))." }
     [System.IO.File]::WriteAllText($tmp, $key + "`r`n", [System.Text.Encoding]::ASCII)
 
-    # cmd.exe handles stdin for wg.exe reliably
-    $cmd = "/c type `"$tmp`" | `"$wgExe`" pubkey"
-    $r = Invoke-ExeCapture -File "cmd.exe" -Args $cmd
-    if ($r.ExitCode -ne 0) { Die "wg pubkey a échoué. $($r.StdErr)" }
+    $cmd = "type `"$tmp`" | `"$wgExe`" pubkey"
+    $r = CmdOut $cmd
+    if ($r.ExitCode -ne 0) { Die "wg pubkey a échoué. $($r.Err)" }
 
-    $pub = Extract-WgKey $r.StdOut
+    $pub = Extract-WgKey ($r.Out + "`n" + $r.Err)
     if ([string]::IsNullOrWhiteSpace($pub)) {
-      Die "wg pubkey n'a pas renvoyé une clé valide. Sortie: $($r.StdOut) Erreur: $($r.StdErr)"
+      Die "wg pubkey n'a pas renvoyé une clé valide. Sortie: $($r.Out) Erreur: $($r.Err)"
     }
     return $pub
   } finally {
@@ -155,12 +152,13 @@ function Get-WgPubKeyFromPriv_File([string]$wgExe, [string]$PrivKey) {
 }
 
 function New-WgKeyPair([string]$wgExe) {
-  $r = Invoke-ExeCapture -File $wgExe -Args "genkey"
-  if ($r.ExitCode -ne 0) { Die "wg genkey a échoué. $($r.StdErr)" }
+  # genkey via cmd.exe (évite les soucis de redirection)
+  $r = CmdOut "`"$wgExe`" genkey"
+  if ($r.ExitCode -ne 0) { Die "wg genkey a échoué. $($r.Err)" }
 
-  $priv = Extract-WgKey $r.StdOut
+  $priv = Extract-WgKey ($r.Out + "`n" + $r.Err)
   if ([string]::IsNullOrWhiteSpace($priv)) {
-    Die "wg genkey n'a pas renvoyé une clé valide. Sortie: $($r.StdOut) Erreur: $($r.StdErr)"
+    Die "wg genkey n'a pas renvoyé une clé valide. Sortie: $($r.Out) Erreur: $($r.Err)"
   }
 
   $pub = Get-WgPubKeyFromPriv_File -wgExe $wgExe -PrivKey $priv
