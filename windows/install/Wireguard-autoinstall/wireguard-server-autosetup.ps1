@@ -1,11 +1,8 @@
-# wireguard-server-autosetup.ps1
+# wireguard-server-autosetup.ps1 (fixed v2)
 # WireGuard SERVER auto-install + config on Windows (10/11/Server).
-# - Installe WireGuard (winget -> MSI fallback)
-# - Crée un tunnel serveur (wg0) en service Windows
-# - Ouvre le port UDP
-# - Active le routage IPv4
-# - (Optionnel) Configure WinNAT (New-NetNat) pour full-tunnel (clients -> Internet via le serveur)
-# - Génère 1+ configs clients et ajoute automatiquement les peers côté serveur
+# Fixes included:
+# - PowerShell ":" parsing in strings -> ${var}:$port
+# - wg pubkey "Trailing characters found after key" -> robust key capture + ASCII stdin (no PS pipeline)
 #
 # Run (PowerShell Admin):
 #   chcp 65001 | Out-Null
@@ -15,7 +12,6 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# UTF-8 output to avoid mojibake (Ã© etc.)
 try {
   chcp 65001 | Out-Null
   $OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
@@ -108,14 +104,52 @@ function Get-WireGuardPaths {
   return @{ wg = $wgExe; wireguard = $wgui }
 }
 
-# Avoid PowerShell pipeline for pubkey conversion (fixes: "Trailing characters found after key")
-function Get-WgPubKeyFromPriv([string]$wgExe, [string]$PrivKey) {
+function Invoke-ExeCapture {
+  param(
+    [Parameter(Mandatory=$true)][string]$File,
+    [Parameter(Mandatory=$false)][string]$Args = ""
+  )
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $File
+  $psi.Arguments = $Args
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError  = $true
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+
+  $p = New-Object System.Diagnostics.Process
+  $p.StartInfo = $psi
+  [void]$p.Start()
+  $out = $p.StandardOutput.ReadToEnd()
+  $err = $p.StandardError.ReadToEnd()
+  $p.WaitForExit()
+
+  return [pscustomobject]@{
+    ExitCode = $p.ExitCode
+    StdOut   = $out
+    StdErr   = $err
+  }
+}
+
+function Extract-WgKey([string]$Text) {
+  # WireGuard keys are base64, typically 44 chars ending with "="
+  $m = [regex]::Match($Text, '([A-Za-z0-9+/]{43}=)')
+  if ($m.Success) { return $m.Groups[1].Value }
+  return $null
+}
+
+function Get-WgPubKeyFromPrivAscii {
+  param(
+    [Parameter(Mandatory=$true)][string]$wgExe,
+    [Parameter(Mandatory=$true)][string]$PrivKey
+  )
+
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $wgExe
   $psi.Arguments = "pubkey"
-  $psi.RedirectStandardInput = $true
+  $psi.RedirectStandardInput  = $true
   $psi.RedirectStandardOutput = $true
-  $psi.RedirectStandardError = $true
+  $psi.RedirectStandardError  = $true
   $psi.UseShellExecute = $false
   $psi.CreateNoWindow = $true
 
@@ -123,26 +157,36 @@ function Get-WgPubKeyFromPriv([string]$wgExe, [string]$PrivKey) {
   $p.StartInfo = $psi
   [void]$p.Start()
 
-  $p.StandardInput.WriteLine($PrivKey.Trim())
+  # Write ASCII bytes (prevents hidden chars / encoding weirdness)
+  $bytes = [System.Text.Encoding]::ASCII.GetBytes(($PrivKey.Trim()) + "`n")
+  $p.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
   $p.StandardInput.Close()
 
   $out = $p.StandardOutput.ReadToEnd()
   $err = $p.StandardError.ReadToEnd()
   $p.WaitForExit()
 
-  if ($p.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($out)) {
+  if ($p.ExitCode -ne 0) {
     Die "wg pubkey a échoué. $err"
   }
-  return $out.Trim()
+
+  $pub = Extract-WgKey $out
+  if ([string]::IsNullOrWhiteSpace($pub)) {
+    Die "wg pubkey n'a pas renvoyé une clé valide. Sortie: $out `nErreur: $err"
+  }
+  return $pub
 }
 
 function New-WgKeyPair([string]$wgExe) {
-  $priv = (& $wgExe genkey 2>$null).Trim()
-  if ([string]::IsNullOrWhiteSpace($priv)) { Die "Échec gen clé privée." }
+  $r = Invoke-ExeCapture -File $wgExe -Args "genkey"
+  if ($r.ExitCode -ne 0) { Die "wg genkey a échoué. $($r.StdErr)" }
 
-  $pub = Get-WgPubKeyFromPriv -wgExe $wgExe -PrivKey $priv
-  if ([string]::IsNullOrWhiteSpace($pub)) { Die "Échec gen clé publique." }
+  $priv = Extract-WgKey $r.StdOut
+  if ([string]::IsNullOrWhiteSpace($priv)) {
+    Die "wg genkey n'a pas renvoyé une clé valide. Sortie: $($r.StdOut) `nErreur: $($r.StdErr)"
+  }
 
+  $pub = Get-WgPubKeyFromPrivAscii -wgExe $wgExe -PrivKey $priv
   return @{ Private=$priv; Public=$pub }
 }
 
@@ -280,7 +324,6 @@ $wgExe = $paths.wg
 $wgui  = $paths.wireguard
 Ok "WireGuard présent: $wgui"
 
-# Pick WAN interface (for default IP hint)
 $ifcs = Get-NetIPConfiguration | Where-Object {
   $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq "Up" -and $_.IPv4Address
 }
@@ -311,7 +354,6 @@ $basePrefix = ($baseIP -split '\.')[0..2] -join '.'
 $serverIP = "$basePrefix.1"
 $serverAddr = "$serverIP/24"
 
-# DNS clients
 Write-Host ""
 Write-Host "DNS à pousser aux clients :" -ForegroundColor Cyan
 Write-Host "  1) Cloudflare (1.1.1.1)"
@@ -332,7 +374,6 @@ switch ($dnsChoice) {
   }
 }
 
-# Routing mode for clients
 Write-Host ""
 Write-Host "Mode de routage client :" -ForegroundColor Cyan
 Write-Host "  1) Full-tunnel (tout passe dans le VPN)      AllowedIPs=0.0.0.0/0"
@@ -343,7 +384,6 @@ if ($routeMode -eq "2") {
   $clientAllowed = Read-Default "AllowedIPs (séparés par virgules)" "$cidr"
 }
 
-# NAT option (for full-tunnel Internet)
 $doNat = $false
 if ($routeMode -eq "1") {
   $doNat = Read-YesNo "Configurer WinNAT pour que les clients aient Internet via ce serveur ?" "y"
@@ -363,13 +403,11 @@ Write-Host ""
 
 if (-not (Read-YesNo "Lancer la configuration maintenant ?" "y")) { Die "Annulé." }
 
-# Keys
 Info "Génération clés serveur…"
 $serverKP = New-WgKeyPair -wgExe $wgExe
 Ok "Clé publique SERVEUR (à mettre chez les clients):"
 Write-Host $serverKP.Public
 
-# Write server conf
 $confDir = Join-Path $env:ProgramData "WireGuard\Tunnels"
 $serverConf = Join-Path $confDir "$tunnelName.conf"
 
@@ -382,20 +420,16 @@ Info "Écriture config serveur: $serverConf"
 Write-ServerConfig -Path $serverConf -Addr $serverAddr -Port $listenPort -PrivKey $serverKP.Private
 Ok "Config serveur écrite."
 
-# Firewall + routing
 Ensure-FirewallRuleUdp -Port $listenPort
 Enable-IPForwarding
 
-# WinNAT (optional)
 if ($doNat) {
   $natName = "WireGuardNAT-$tunnelName"
   [void](Try-Configure-WinNAT -NatName $natName -InternalPrefix $cidr)
 }
 
-# Install tunnel service
 Install-TunnelService -wireguardExe $wgui -ConfPath $serverConf -TunnelName $tunnelName
 
-# Clients
 Write-Host ""
 Info "Génération des clients (au moins 1)."
 $clientsDir = Join-Path $env:Public "WireGuard-Clients"
@@ -432,7 +466,6 @@ while ($true) {
   if (-not (Read-YesNo "Ajouter un autre client ?" "y")) { break }
 }
 
-# Reload peers
 Restart-TunnelService -TunnelName $tunnelName
 
 Write-Host ""
