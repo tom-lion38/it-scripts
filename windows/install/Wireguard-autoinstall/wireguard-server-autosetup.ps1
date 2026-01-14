@@ -1,26 +1,10 @@
-# wireguard-server-autosetup.ps1 (v8)
-# WireGuard SERVER auto-setup (Windows) - robust keygen + cleaner output (ASCII only)
-#
-# Fixes:
-# - If "wg.exe genkey" hangs on some hosts: we add timeout + multiple fallbacks
-# - No fake "WinNAT created" message if it fails
-# - Output messages are ASCII (avoids mojibake like "Ã©", "â€¦")
-#
-# Run (PowerShell as Admin):
-#   chcp 65001 | Out-Null
-#   Set-ExecutionPolicy Bypass -Scope Process -Force
-#   .\wireguard-server-autosetup.ps1
-#
-# Notes:
-# - Full-tunnel (AllowedIPs=0.0.0.0/0) needs NAT. WinNAT may fail on some systems (0x80041013).
-#   If WinNAT fails, script offers split-tunnel fallback.
-# - Client configs are written to: C:\Users\Public\WireGuard-Clients\
+# wireguard-server-autosetup.ps1 (v6)
+# Fix: WinNAT error handling + optional ICS fallback
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 try { chcp 65001 | Out-Null } catch {}
-try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new() } catch {}
 
 function Info($m){ Write-Host "[INFO] $m" -ForegroundColor Cyan }
 function Ok($m){   Write-Host "[OK]   $m" -ForegroundColor Green }
@@ -42,12 +26,12 @@ function Read-Default([string]$Prompt, [string]$Default = "") {
 
 function Read-YesNo([string]$Prompt, [string]$Default = "y") {
   while ($true) {
-    $v = Read-Host "$Prompt [y/n] (default: $Default)"
+    $v = Read-Host "$Prompt [y/n] (défaut: $Default)"
     if ([string]::IsNullOrWhiteSpace($v)) { $v = $Default }
     switch ($v.ToLowerInvariant()) {
       "y" { return $true }
       "n" { return $false }
-      default { Write-Host "Answer y or n." }
+      default { Write-Host "Réponds y ou n." }
     }
   }
 }
@@ -61,12 +45,56 @@ function Get-ArchTag {
   }
 }
 
+function Install-WireGuard-WithWinget {
+  if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return $false }
+  Info "Installation via winget (WireGuard.WireGuard)…"
+  $p = Start-Process -FilePath "winget" -ArgumentList @(
+    "install","-e","--id","WireGuard.WireGuard",
+    "--accept-package-agreements","--accept-source-agreements"
+  ) -Wait -PassThru -WindowStyle Hidden
+  if ($p.ExitCode -eq 0) { Ok "WireGuard installé (winget)."; return $true }
+  Warn "winget a échoué (code $($p.ExitCode)). Fallback MSI…"
+  return $false
+}
+
+function Install-WireGuard-WithMSI {
+  $arch = Get-ArchTag
+  $base = "https://download.wireguard.com/windows-client/"
+  Info "Récupération de la liste officielle des MSIs…"
+  $html = (Invoke-WebRequest -Uri $base -UseBasicParsing).Content
+
+  $regex = "wireguard-$arch-([0-9]+\.[0-9]+\.[0-9]+)\.msi"
+  $matches = [regex]::Matches($html, $regex)
+  if ($matches.Count -lt 1) { Die "Impossible de trouver un MSI WireGuard pour arch=$arch" }
+
+  $ver = $matches[$matches.Count - 1].Groups[1].Value
+  $msiName = "wireguard-$arch-$ver.msi"
+  $msiUrl  = $base + $msiName
+  $msiPath = Join-Path $env:TEMP $msiName
+
+  Info "Téléchargement MSI: $msiName"
+  Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath -UseBasicParsing
+  if (-not (Test-Path $msiPath)) { Die "Téléchargement échoué: $msiPath" }
+  Ok "MSI téléchargé: $msiPath"
+
+  Info "Installation silencieuse (msiexec)…"
+  $args = "/i `"$msiPath`" /qn DO_NOT_LAUNCH=1"
+  $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
+  if ($p.ExitCode -ne 0) { Die "msiexec a échoué (code $($p.ExitCode))." }
+  Ok "WireGuard installé (MSI)."
+  return $true
+}
+
+function Get-WireGuardPaths {
+  $wgExe = Join-Path $env:ProgramFiles "WireGuard\wg.exe"
+  $wgui  = Join-Path $env:ProgramFiles "WireGuard\wireguard.exe"
+  if (-not (Test-Path $wgExe)) { Die "wg.exe introuvable: $wgExe" }
+  if (-not (Test-Path $wgui))  { Die "wireguard.exe introuvable: $wgui" }
+  return @{ wg = $wgExe; wireguard = $wgui }
+}
+
 function Invoke-ExeCapture {
-  param(
-    [Parameter(Mandatory=$true)][string]$File,
-    [Parameter(Mandatory=$false)][string]$Args = "",
-    [Parameter(Mandatory=$false)][int]$TimeoutMs = 15000
-  )
+  param([string]$File,[string]$Args="")
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $File
   $psi.Arguments = $Args
@@ -74,163 +102,144 @@ function Invoke-ExeCapture {
   $psi.RedirectStandardError  = $true
   $psi.UseShellExecute = $false
   $psi.CreateNoWindow = $true
-
   $p = New-Object System.Diagnostics.Process
   $p.StartInfo = $psi
   [void]$p.Start()
-
-  if (-not $p.WaitForExit($TimeoutMs)) {
-    try { $p.Kill() } catch {}
-    return [pscustomobject]@{ ExitCode = 124; StdOut = ""; StdErr = "TIMEOUT" }
-  }
-
   $out = $p.StandardOutput.ReadToEnd()
   $err = $p.StandardError.ReadToEnd()
-  return [pscustomobject]@{ ExitCode = $p.ExitCode; StdOut = $out; StdErr = $err }
+  $p.WaitForExit()
+  [pscustomobject]@{ ExitCode=$p.ExitCode; StdOut=$out; StdErr=$err }
 }
 
 function Extract-WgKey([string]$Text) {
-  # WireGuard key is base64 44 chars ending with "="
   $m = [regex]::Match($Text, '([A-Za-z0-9+/]{43}=)')
   if ($m.Success) { return $m.Groups[1].Value }
   return $null
-}
-
-function Install-WireGuard-WithWinget {
-  if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return $false }
-  Info "Install via winget (WireGuard.WireGuard)..."
-  $p = Start-Process -FilePath "winget" -ArgumentList @(
-    "install","-e","--id","WireGuard.WireGuard",
-    "--accept-package-agreements","--accept-source-agreements"
-  ) -Wait -PassThru -WindowStyle Hidden
-  if ($p.ExitCode -eq 0) { Ok "WireGuard installed (winget)."; return $true }
-  Warn "winget failed (code $($p.ExitCode)). MSI fallback..."
-  return $false
-}
-
-function Install-WireGuard-WithMSI {
-  $arch = Get-ArchTag
-  $base = "https://download.wireguard.com/windows-client/"
-  Info "Fetch official MSI list..."
-  $html = (Invoke-WebRequest -Uri $base -UseBasicParsing).Content
-
-  $regex = "wireguard-$arch-([0-9]+\.[0-9]+\.[0-9]+)\.msi"
-  $matches = [regex]::Matches($html, $regex)
-  if ($matches.Count -lt 1) { Die "No MSI found for arch=$arch" }
-
-  $ver = $matches[$matches.Count - 1].Groups[1].Value
-  $msiName = "wireguard-$arch-$ver.msi"
-  $msiUrl  = $base + $msiName
-  $msiPath = Join-Path $env:TEMP $msiName
-
-  Info "Download MSI: $msiName"
-  Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath -UseBasicParsing
-  if (-not (Test-Path $msiPath)) { Die "Download failed: $msiPath" }
-  Ok "MSI downloaded: $msiPath"
-
-  Info "Silent install (msiexec)..."
-  $args = "/i `"$msiPath`" /qn DO_NOT_LAUNCH=1"
-  $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
-  if ($p.ExitCode -ne 0) { Die "msiexec failed (code $($p.ExitCode))" }
-  Ok "WireGuard installed (MSI)."
-  return $true
-}
-
-function Get-WireGuardPaths {
-  $wgExe = Join-Path $env:ProgramFiles "WireGuard\wg.exe"
-  $wgui  = Join-Path $env:ProgramFiles "WireGuard\wireguard.exe"
-  return @{
-    wg = $wgExe
-    wireguard = $wgui
-    present = ((Test-Path $wgExe) -and (Test-Path $wgui))
-  }
 }
 
 function Get-WgPubKeyFromPriv_File([string]$wgExe, [string]$PrivKey) {
   $tmp = Join-Path $env:TEMP ("wg-priv-" + [guid]::NewGuid().ToString("N") + ".txt")
   try {
     $key = $PrivKey.Trim()
-    [IO.File]::WriteAllText($tmp, $key + "`r`n", [Text.Encoding]::ASCII)
+    if ($key.Length -ne 44) { Die "Clé privée inattendue (len=$($key.Length))." }
+    [System.IO.File]::WriteAllText($tmp, $key + "`r`n", [System.Text.Encoding]::ASCII)
 
     $cmd = "/c type `"$tmp`" | `"$wgExe`" pubkey"
-    $r = Invoke-ExeCapture -File "cmd.exe" -Args $cmd -TimeoutMs 8000
-    if ($r.ExitCode -ne 0) { Die "wg pubkey failed. $($r.StdErr)" }
+    $r = Invoke-ExeCapture -File "cmd.exe" -Args $cmd
+    if ($r.ExitCode -ne 0) { Die "wg pubkey a échoué. $($r.StdErr)" }
 
     $pub = Extract-WgKey ($r.StdOut + "`n" + $r.StdErr)
-    if ([string]::IsNullOrWhiteSpace($pub)) { Die "wg pubkey produced no valid key." }
+    if ([string]::IsNullOrWhiteSpace($pub)) { Die "wg pubkey n'a pas renvoyé une clé valide." }
     return $pub
   } finally {
     if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
   }
 }
 
-function Get-GenKeyRobust([string]$wgExe) {
-  # Try 1: direct call (can hang -> timeout via job is messy; use cmd capture first for timeout)
-  # Try 2: cmd.exe /c "wg.exe genkey" with timeout
-  # Try 3: direct PS call (no timeout, but usually works when cmd fails)
-  # Return: private key (44 chars)
-
-  # Try 1 (cmd with timeout)
-  $r1 = Invoke-ExeCapture -File "cmd.exe" -Args "/c `"$wgExe`" genkey" -TimeoutMs 8000
-  $k1 = Extract-WgKey ($r1.StdOut + "`n" + $r1.StdErr)
-  if ($r1.ExitCode -eq 0 -and $k1) { return $k1 }
-
-  # Try 2 (direct PS)
-  try {
-    $raw = (& $wgExe genkey 2>&1)
-    $txt = ($raw | Out-String)
-    $k2 = Extract-WgKey $txt
-    if ($k2) { return $k2 }
-  } catch {}
-
-  # If we are here: something is really wrong
-  Die "Stuck/failed at server key generation. wg genkey did not return a valid key."
+function New-WgKeyPair([string]$wgExe) {
+  $raw = (& $wgExe genkey 2>&1)
+  $txt = ($raw | Out-String)
+  $priv = Extract-WgKey $txt
+  if ([string]::IsNullOrWhiteSpace($priv)) { Die "wg genkey n'a pas renvoyé une clé valide. Sortie: $txt" }
+  $pub = Get-WgPubKeyFromPriv_File -wgExe $wgExe -PrivKey $priv
+  @{ Private=$priv; Public=$pub }
 }
 
-function New-WgKeyPair([string]$wgExe) {
-  $priv = Get-GenKeyRobust -wgExe $wgExe
-  $pub  = Get-WgPubKeyFromPriv_File -wgExe $wgExe -PrivKey $priv
-  return @{ Private=$priv; Public=$pub }
+function Select-FromList([string]$Title, [object[]]$Items, [scriptblock]$Render) {
+  $arr = @($Items)
+  if ($arr.Length -eq 0) { return $null }
+  Write-Host ""
+  Write-Host $Title -ForegroundColor Cyan
+  for ($i=0; $i -lt $arr.Length; $i++) { Write-Host ("  {0}) {1}" -f ($i+1), (& $Render $arr[$i])) }
+  while ($true) {
+    $raw = Read-Host "Choix (1-$($arr.Length))"
+    if ($raw -match '^\d+$') {
+      $n = [int]$raw
+      if ($n -ge 1 -and $n -le $arr.Length) { return $arr[$n-1] }
+    }
+    Write-Host "Choix invalide."
+  }
 }
 
 function Ensure-FirewallRuleUdp([int]$Port) {
   $name = "WireGuard UDP $Port"
   $existing = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
-  if ($existing) { Ok "Firewall rule exists: $name"; return }
-  Info "Open Windows Firewall: $Port/udp..."
+  if ($existing) { Ok "Firewall rule déjà présente: $name"; return }
+  Info "Ouverture firewall Windows: $Port/udp…"
   New-NetFirewallRule -DisplayName $name -Direction Inbound -Action Allow -Protocol UDP -LocalPort $Port | Out-Null
   Ok "Firewall OK."
 }
 
 function Enable-IPForwarding {
-  Info "Enable IPv4 routing (IPEnableRouter=1)..."
+  Info "Activation routage IPv4 (IPEnableRouter=1)…"
   New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" `
     -Name "IPEnableRouter" -PropertyType DWord -Value 1 -Force | Out-Null
-  Ok "IPv4 routing enabled (registry)."
+  Ok "Routage IPv4 activé (registry)."
 }
 
 function Try-Configure-WinNAT([string]$NatName, [string]$InternalPrefix) {
   if (-not (Get-Command New-NetNat -ErrorAction SilentlyContinue)) {
-    Warn "New-NetNat not available. WinNAT disabled."
+    Warn "New-NetNat introuvable. WinNAT indisponible."
     return $false
   }
   try {
     $existing = Get-NetNat -Name $NatName -ErrorAction SilentlyContinue
     if ($existing) {
-      Warn "NAT '$NatName' already exists."
-      if (Read-YesNo "Remove and recreate NAT?" "n") {
+      Warn "NAT '$NatName' existe déjà."
+      if (Read-YesNo "Le supprimer et le recréer ?" "n") {
         Remove-NetNat -Name $NatName -Confirm:$false
-        Ok "NAT removed."
+        Ok "NAT supprimé."
       } else {
         return $true
       }
     }
-    Info "Create WinNAT: $NatName (Internal=$InternalPrefix)..."
+    Info "Création WinNAT: $NatName (Internal=$InternalPrefix)…"
     New-NetNat -Name $NatName -InternalIPInterfaceAddressPrefix $InternalPrefix | Out-Null
-    Ok "WinNAT created."
+    Ok "WinNAT créé."
     return $true
   } catch {
-    Warn "WinNAT failed: $($_.Exception.Message)"
+    Warn "WinNAT a échoué: $($_.Exception.Message)"
+    return $false
+  }
+}
+
+function Enable-ICS_Fallback([string]$PublicIfName, [string]$PrivateIfName) {
+  Warn "Fallback ICS (Internet Connection Sharing) demandé."
+  Warn "ICS est moins propre que RRAS/WinNAT, mais ça marche souvent."
+  Warn "Tentative d'activation ICS via COM (peut échouer selon editions/politiques)."
+
+  try {
+    $hnet = New-Object -ComObject HNetCfg.HNetShare
+    $connections = @($hnet.EnumEveryConnection())
+    $pub = $null
+    $priv = $null
+
+    foreach ($c in $connections) {
+      $p = $hnet.NetConnectionProps($c)
+      if ($p.Name -eq $PublicIfName) { $pub = $c }
+      if ($p.Name -eq $PrivateIfName) { $priv = $c }
+    }
+
+    if (-not $pub -or -not $priv) {
+      Warn "Impossible de trouver les interfaces pour ICS (public='$PublicIfName', private='$PrivateIfName')."
+      return $false
+    }
+
+    $pubCfg  = $hnet.INetSharingConfigurationForINetConnection($pub)
+    $privCfg = $hnet.INetSharingConfigurationForINetConnection($priv)
+
+    # Disable existing
+    if ($pubCfg.SharingEnabled)  { $pubCfg.DisableSharing() }
+    if ($privCfg.SharingEnabled) { $privCfg.DisableSharing() }
+
+    # 0 = Public, 1 = Private
+    $pubCfg.EnableSharing(0)
+    $privCfg.EnableSharing(1)
+
+    Ok "ICS activé (public='$PublicIfName' -> private='$PrivateIfName')."
+    return $true
+  } catch {
+    Warn "ICS a échoué: $($_.Exception.Message)"
     return $false
   }
 }
@@ -238,13 +247,17 @@ function Try-Configure-WinNAT([string]$NatName, [string]$InternalPrefix) {
 function Write-ServerConfig([string]$Path,[string]$Addr,[int]$Port,[string]$PrivKey) {
   $dir = Split-Path -Parent $Path
   if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
-  $content = "[Interface]`r`nAddress = $Addr`r`nListenPort = $Port`r`nPrivateKey = $PrivKey`r`n"
+  $content = @"
+[Interface]
+Address = $Addr
+ListenPort = $Port
+PrivateKey = $PrivKey
+"@
   Set-Content -Path $Path -Value $content -Encoding ASCII
 }
 
 function Append-PeerToServer([string]$Path,[string]$ClientPub,[string]$ClientIP32) {
-  $block = "`r`n[Peer]`r`nPublicKey = $ClientPub`r`nAllowedIPs = $ClientIP32`r`n"
-  Add-Content -Path $Path -Value $block -Encoding ASCII
+  Add-Content -Path $Path -Value "`r`n[Peer]`r`nPublicKey = $ClientPub`r`nAllowedIPs = $ClientIP32" -Encoding ASCII
 }
 
 function Write-ClientConfig(
@@ -253,32 +266,34 @@ function Write-ClientConfig(
 ) {
   $dir = Split-Path -Parent $Path
   if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
-  $content =
-"[Interface]`r`n" +
-"PrivateKey = $ClientPriv`r`n" +
-"Address = $ClientIP/32`r`n" +
-"DNS = $Dns`r`n`r`n" +
-"[Peer]`r`n" +
-"PublicKey = $ServerPub`r`n" +
-"Endpoint = ${Endpoint}:$Port`r`n" +
-"AllowedIPs = $Allowed`r`n" +
-"PersistentKeepalive = $Keepalive`r`n"
+  $content = @"
+[Interface]
+PrivateKey = $ClientPriv
+Address = $ClientIP/32
+DNS = $Dns
+
+[Peer]
+PublicKey = $ServerPub
+Endpoint = ${Endpoint}:$Port
+AllowedIPs = $Allowed
+PersistentKeepalive = $Keepalive
+"@
   Set-Content -Path $Path -Value $content -Encoding ASCII
 }
 
 function Install-TunnelService([string]$wireguardExe,[string]$ConfPath,[string]$TunnelName) {
-  Info "Install tunnel service: $TunnelName"
+  Info "Installation tunnel service: $TunnelName"
   & $wireguardExe /installtunnelservice $ConfPath | Out-Null
   Start-Sleep -Milliseconds 300
   $svc = "WireGuardTunnel`$$TunnelName"
   try { Start-Service -Name $svc -ErrorAction SilentlyContinue } catch {}
-  Ok "Service: $svc"
+  Ok "Service tunnel: $svc"
 }
 
 function Restart-TunnelService([string]$TunnelName) {
   $svc = "WireGuardTunnel`$$TunnelName"
-  try { Restart-Service -Name $svc -Force; Ok "Service restarted: $svc" }
-  catch { Warn "Cannot restart $svc automatically." }
+  try { Restart-Service -Name $svc -Force; Ok "Service redémarré: $svc" }
+  catch { Warn "Impossible de redémarrer $svc automatiquement." }
 }
 
 function Next-ClientIP([string]$BasePrefix,[int]$Start,[string[]]$Used) {
@@ -290,56 +305,38 @@ function Next-ClientIP([string]$BasePrefix,[int]$Start,[string[]]$Used) {
 }
 
 # ---------------- MAIN ----------------
-if (-not (Test-Admin)) { Die "Run PowerShell as Administrator." }
+if (-not (Test-Admin)) { Die "Lance PowerShell en Administrateur." }
 
 Info "WireGuard SERVER auto-setup (Windows)"
 
-$paths0 = Get-WireGuardPaths
-if (-not $paths0.present) {
-  $installed = Install-WireGuard-WithWinget
-  if (-not $installed) { $installed = Install-WireGuard-WithMSI }
-  if (-not $installed) { Die "WireGuard install failed." }
-}
+$installed = Install-WireGuard-WithWinget
+if (-not $installed) { $installed = Install-WireGuard-WithMSI }
+if (-not $installed) { Die "Installation WireGuard impossible." }
 
 $paths = Get-WireGuardPaths
-if (-not $paths.present) { Die "WireGuard binaries not found after install." }
-
 $wgExe = $paths.wg
 $wgui  = $paths.wireguard
-Ok "WireGuard present: $wgui"
+Ok "WireGuard présent: $wgui"
 
 $ifcs = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq "Up" -and $_.IPv4Address }
 $pick = if ($ifcs) {
-  $arr = @($ifcs)
-  Write-Host ""
-  Write-Host "Select WAN interface:" -ForegroundColor Cyan
-  for ($i=0; $i -lt $arr.Length; $i++) {
-    Write-Host ("  {0}) {1} | {2}" -f ($i+1), $arr[$i].InterfaceAlias, $arr[$i].IPv4Address.IPAddress)
-  }
-  while ($true) {
-    $raw = Read-Host "Choice (1-$($arr.Length))"
-    if ($raw -match '^\d+$') {
-      $n = [int]$raw
-      if ($n -ge 1 -and $n -le $arr.Length) { $arr[$n-1]; break }
-    }
-    Write-Host "Invalid choice."
-  }
+  Select-FromList "Choisis l'interface WAN (celle qui sort Internet/LAN principal)" $ifcs { param($x) "$($x.InterfaceAlias)  |  $($x.IPv4Address.IPAddress)" }
 } else { $null }
-
 $defaultIP = if ($pick) { $pick.IPv4Address.IPAddress } else { "" }
+$publicIfName = if ($pick) { $pick.InterfaceAlias } else { "" }
 
-$tunnelName = Read-Default "Tunnel name (service)" "wg0"
-if ($tunnelName -notmatch '^[a-zA-Z0-9._-]+$') { Die "Invalid tunnel name." }
+$tunnelName = Read-Default "Nom du tunnel serveur (service)" "wg0"
+if ($tunnelName -notmatch '^[a-zA-Z0-9._-]+$') { Die "Nom invalide (lettres/chiffres/._-)." }
 
-$endpoint = Read-Default "Endpoint IP/DNS (public or LAN)" $defaultIP
-if ([string]::IsNullOrWhiteSpace($endpoint)) { Die "Endpoint empty." }
+$endpoint = Read-Default "IP/DNS que les clients utiliseront (endpoint public ou LAN)" $defaultIP
+if ([string]::IsNullOrWhiteSpace($endpoint)) { Die "Endpoint vide." }
 
-$portRaw = Read-Default "WireGuard UDP port" "51820"
-if ($portRaw -notmatch '^\d+$') { Die "Invalid port." }
+$portRaw = Read-Default "Port WireGuard UDP" "51820"
+if ($portRaw -notmatch '^\d+$') { Die "Port invalide." }
 $listenPort = [int]$portRaw
 
-$cidr = Read-Default "WireGuard network (CIDR /24 only)" "10.8.0.0/24"
-if ($cidr -notmatch '^(\d{1,3}\.){3}\d{1,3}/24$') { Die "Only /24 supported (example: 10.8.0.0/24)." }
+$cidr = Read-Default "Réseau WireGuard (CIDR /24 recommandé)" "10.8.0.0/24"
+if ($cidr -notmatch '^(\d{1,3}\.){3}\d{1,3}/24$') { Die "Ce script gère /24 uniquement (ex: 10.8.0.0/24)." }
 
 $baseIP = $cidr.Split('/')[0]
 $basePrefix = ($baseIP -split '\.')[0..2] -join '.'
@@ -347,12 +344,12 @@ $serverIP = "$basePrefix.1"
 $serverAddr = "$serverIP/24"
 
 Write-Host ""
-Write-Host "DNS to push to clients:" -ForegroundColor Cyan
+Write-Host "DNS à pousser aux clients :" -ForegroundColor Cyan
 Write-Host "  1) Cloudflare (1.1.1.1)"
 Write-Host "  2) Google (8.8.8.8)"
 Write-Host "  3) Quad9 (9.9.9.9)"
-Write-Host "  4) Server DNS (auto)"
-$dnsChoice = Read-Default "Choice" "1"
+Write-Host "  4) DNS du serveur (automatique)"
+$dnsChoice = Read-Default "Ton choix" "1"
 $dns = "1.1.1.1"
 switch ($dnsChoice) {
   "1" { $dns="1.1.1.1" }
@@ -365,49 +362,44 @@ switch ($dnsChoice) {
 }
 
 Write-Host ""
-Write-Host "Client routing mode:" -ForegroundColor Cyan
-Write-Host "  1) Full-tunnel (AllowedIPs=0.0.0.0/0)"
-Write-Host "  2) Split-tunnel (choose networks)"
-$routeMode = Read-Default "Choice" "1"
-
+Write-Host "Mode de routage client :" -ForegroundColor Cyan
+Write-Host "  1) Full-tunnel (tout passe dans le VPN)      AllowedIPs=0.0.0.0/0"
+Write-Host "  2) Split-tunnel (réseaux choisis)           AllowedIPs=ex: 10.8.0.0/24,192.168.1.0/24"
+$routeMode = Read-Default "Ton choix" "1"
 $clientAllowed = "0.0.0.0/0"
-if ($routeMode -eq "2") {
-  $clientAllowed = Read-Default "AllowedIPs (comma separated)" "$cidr,192.168.1.0/24"
-}
+if ($routeMode -eq "2") { $clientAllowed = Read-Default "AllowedIPs (séparés par virgules)" "$cidr" }
 
 $doNat = $false
-if ($routeMode -eq "1") {
-  $doNat = Read-YesNo "Enable WinNAT for full-tunnel internet (may fail on some Windows)?" "y"
-}
+if ($routeMode -eq "1") { $doNat = Read-YesNo "Configurer NAT pour que les clients aient Internet via ce serveur ?" "y" }
+else { $doNat = Read-YesNo "Configurer NAT quand même ? (rarement utile en split)" "n" }
 
 Write-Host ""
-Info "Summary:"
-Write-Host "  Tunnel    : $tunnelName"
-Write-Host "  Endpoint  : ${endpoint}:$listenPort/udp"
-Write-Host "  WG net    : $cidr (server $serverIP)"
-Write-Host "  DNS       : $dns"
-Write-Host "  AllowedIPs: $clientAllowed"
-Write-Host "  WinNAT    : $doNat"
+Info "Résumé :"
+Write-Host "  Tunnel     : $tunnelName"
+Write-Host "  Endpoint   : ${endpoint}:$listenPort/udp"
+Write-Host "  WG réseau  : $cidr (serveur: $serverIP)"
+Write-Host "  DNS client : $dns"
+Write-Host "  AllowedIPs : $clientAllowed"
+Write-Host "  NAT demandé: $doNat"
 Write-Host ""
 
-if (-not (Read-YesNo "Start now?" "y")) { Die "Cancelled." }
+if (-not (Read-YesNo "Lancer la configuration maintenant ?" "y")) { Die "Annulé." }
 
-Info "Generate server keys (robust)..."
+Info "Génération clés serveur…"
 $serverKP = New-WgKeyPair -wgExe $wgExe
-Ok "Server PublicKey:"
+Ok "Clé publique SERVEUR (à mettre chez les clients):"
 Write-Host $serverKP.Public
 
 $confDir = Join-Path $env:ProgramData "WireGuard\Tunnels"
 $serverConf = Join-Path $confDir "$tunnelName.conf"
-
 if (Test-Path $serverConf) {
-  Warn "Server config already exists: $serverConf"
-  if (-not (Read-YesNo "Overwrite?" "n")) { Die "Cancelled." }
+  Warn "Config existe déjà: $serverConf"
+  if (-not (Read-YesNo "Écraser ?" "n")) { Die "Annulé." }
 }
 
-Info "Write server config: $serverConf"
+Info "Écriture config serveur: $serverConf"
 Write-ServerConfig -Path $serverConf -Addr $serverAddr -Port $listenPort -PrivKey $serverKP.Private
-Ok "Server config written."
+Ok "Config serveur écrite."
 
 Ensure-FirewallRuleUdp -Port $listenPort
 Enable-IPForwarding
@@ -415,42 +407,57 @@ Enable-IPForwarding
 if ($doNat) {
   $okNat = Try-Configure-WinNAT -NatName ("WireGuardNAT-$tunnelName") -InternalPrefix $cidr
   if (-not $okNat) {
-    Warn "WinNAT not available on this machine."
-    Warn "Simple fallback: switch clients to split-tunnel (no NAT needed)."
-    if (Read-YesNo "Switch to split-tunnel now?" "y") {
-      $clientAllowed = Read-Default "AllowedIPs (split-tunnel)" "$cidr,192.168.1.0/24"
-      Warn "OK. Clients will NOT use this server for all internet traffic."
+    Warn "WinNAT indisponible sur ta machine."
+    Warn "Options : RRAS (recommandé sur Windows Server) ou ICS (fallback)."
+    if (Read-YesNo "Tenter ICS automatiquement ?" "n") {
+      # After the tunnel is up, a WireGuard adapter will exist; we will try later after service install.
+      $script:DoICS = $true
     } else {
-      Warn "If you need full-tunnel on Windows Server: use RRAS NAT."
+      Warn "Tu peux aussi repasser en split-tunnel (AllowedIPs=réseaux internes) pour éviter le NAT."
     }
   }
 }
 
 Install-TunnelService -wireguardExe $wgui -ConfPath $serverConf -TunnelName $tunnelName
 
+# ICS fallback after tunnel exists
+if ($doNat -and ($script:DoICS -eq $true)) {
+  Start-Sleep -Seconds 1
+  $wgIf = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "WireGuard Tunnel*" -and $_.Name -like "*$tunnelName*" } | Select-Object -First 1
+  if (-not $wgIf) {
+    # fallback: any WireGuard Tunnel
+    $wgIf = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "WireGuard Tunnel*" } | Select-Object -First 1
+  }
+  if ($wgIf) {
+    [void](Enable-ICS_Fallback -PublicIfName $publicIfName -PrivateIfName $wgIf.Name)
+  } else {
+    Warn "Interface WireGuard non trouvée pour ICS."
+  }
+}
+
 Write-Host ""
-Info "Client generation."
+Info "Génération des clients."
 $clientsDir = Join-Path $env:Public "WireGuard-Clients"
 $used = @($serverIP)
 $startOctet = 2
 $keepalive = 25
 
 while ($true) {
-  $clientName = Read-Host "Client name (example: phone1) or ENTER to finish"
+  $clientName = Read-Host "Nom du client (ex: phone1) ou ENTER pour finir"
   if ([string]::IsNullOrWhiteSpace($clientName)) { break }
-  if ($clientName -notmatch '^[a-zA-Z0-9._-]+$') { Write-Host "Invalid name."; continue }
+  if ($clientName -notmatch '^[a-zA-Z0-9._-]+$') { Write-Host "Nom invalide."; continue }
 
   $suggest = Next-ClientIP -BasePrefix $basePrefix -Start $startOctet -Used $used
-  if (-not $suggest) { Die "No more IPs in /24." }
+  if (-not $suggest) { Die "Plus d'IP disponibles dans /24." }
 
-  $clientIP = Read-Default "Client IP (in $cidr)" $suggest
-  if ($clientIP -notmatch '^(\d{1,3}\.){3}\d{1,3}$') { Write-Host "Invalid IP."; continue }
-  if ($used -contains $clientIP) { Write-Host "IP already used."; continue }
-  if (($clientIP -split '\.')[0..2] -join '.' -ne $basePrefix) { Write-Host "IP outside /24."; continue }
+  $clientIP = Read-Default "IP client (dans $cidr)" $suggest
+  if ($clientIP -notmatch '^(\d{1,3}\.){3}\d{1,3}$') { Write-Host "IP invalide."; continue }
+  if ($used -contains $clientIP) { Write-Host "IP déjà utilisée."; continue }
+  if (($clientIP -split '\.')[0..2] -join '.' -ne $basePrefix) { Write-Host "IP hors du /24."; continue }
 
-  Info "Generate client keys..."
+  Info "Génération clés client…"
   $ckp = New-WgKeyPair -wgExe $wgExe
-  Ok "Client PublicKey:"
+  Ok "Clé publique CLIENT (peer côté serveur):"
   Write-Host $ckp.Public
 
   Append-PeerToServer -Path $serverConf -ClientPub $ckp.Public -ClientIP32 "$clientIP/32"
@@ -459,17 +466,17 @@ while ($true) {
   $clientConf = Join-Path $clientsDir "$clientName.conf"
   Write-ClientConfig -Path $clientConf -ClientPriv $ckp.Private -ClientIP $clientIP -Dns $dns `
     -ServerPub $serverKP.Public -Endpoint $endpoint -Port $listenPort -Allowed $clientAllowed -Keepalive $keepalive
-  Ok "Client config: $clientConf"
+  Ok "Client généré: $clientConf"
 
-  if (-not (Read-YesNo "Add another client?" "y")) { break }
+  if (-not (Read-YesNo "Ajouter un autre client ?" "y")) { break }
 }
 
 Restart-TunnelService -TunnelName $tunnelName
 
 Write-Host ""
-Ok "Done."
-Info "Server config : $serverConf"
-Info "Client configs: $clientsDir\*.conf"
-Info "Status       : `"$wgExe`" show"
-Info "Service      : WireGuardTunnel`$$tunnelName"
-Info "Logs         : `"$wgui`" /dumplog"
+Ok "Terminé."
+Info "Config serveur : $serverConf"
+Info "Configs clients: $clientsDir\*.conf"
+Info "Voir état      : `"$wgExe`" show"
+Info "Service        : WireGuardTunnel`$$tunnelName"
+Info "Logs WG        : `"$wgui`" /dumplog"
