@@ -1,10 +1,12 @@
-# wireguard-server-autosetup.ps1 (fixed v2)
-# WireGuard SERVER auto-install + config on Windows (10/11/Server).
-# Fixes included:
-# - PowerShell ":" parsing in strings -> ${var}:$port
-# - wg pubkey "Trailing characters found after key" -> robust key capture + ASCII stdin (no PS pipeline)
+# wireguard-server-autosetup.ps1 (v3 - Windows SERVER)
+# - Installs WireGuard (winget -> MSI fallback)
+# - Creates a SERVER tunnel as a Windows service
+# - Opens UDP port in Windows Firewall
+# - Enables IPv4 routing
+# - Optional WinNAT for full-tunnel Internet
+# - Generates client configs and appends peers to server config
 #
-# Run (PowerShell Admin):
+# Run (Admin):
 #   chcp 65001 | Out-Null
 #   Set-ExecutionPolicy Bypass -Scope Process -Force
 #   .\wireguard-server-autosetup.ps1
@@ -105,10 +107,7 @@ function Get-WireGuardPaths {
 }
 
 function Invoke-ExeCapture {
-  param(
-    [Parameter(Mandatory=$true)][string]$File,
-    [Parameter(Mandatory=$false)][string]$Args = ""
-  )
+  param([string]$File,[string]$Args)
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $File
   $psi.Arguments = $Args
@@ -116,65 +115,43 @@ function Invoke-ExeCapture {
   $psi.RedirectStandardError  = $true
   $psi.UseShellExecute = $false
   $psi.CreateNoWindow = $true
-
   $p = New-Object System.Diagnostics.Process
   $p.StartInfo = $psi
   [void]$p.Start()
   $out = $p.StandardOutput.ReadToEnd()
   $err = $p.StandardError.ReadToEnd()
   $p.WaitForExit()
-
-  return [pscustomobject]@{
-    ExitCode = $p.ExitCode
-    StdOut   = $out
-    StdErr   = $err
-  }
+  return [pscustomobject]@{ ExitCode=$p.ExitCode; StdOut=$out; StdErr=$err }
 }
 
 function Extract-WgKey([string]$Text) {
-  # WireGuard keys are base64, typically 44 chars ending with "="
   $m = [regex]::Match($Text, '([A-Za-z0-9+/]{43}=)')
   if ($m.Success) { return $m.Groups[1].Value }
   return $null
 }
 
-function Get-WgPubKeyFromPrivAscii {
-  param(
-    [Parameter(Mandatory=$true)][string]$wgExe,
-    [Parameter(Mandatory=$true)][string]$PrivKey
-  )
+# Most reliable on Windows: write key to temp file, run `type file | wg pubkey`
+function Get-WgPubKeyFromPriv_File([string]$wgExe, [string]$PrivKey) {
+  $tmp = Join-Path $env:TEMP ("wg-priv-" + [guid]::NewGuid().ToString("N") + ".txt")
+  try {
+    # Ensure ASCII, exactly the 44 chars + newline
+    $key = $PrivKey.Trim()
+    if ($key.Length -ne 44) { Die "Clé privée inattendue (len=$($key.Length))." }
+    [System.IO.File]::WriteAllText($tmp, $key + "`r`n", [System.Text.Encoding]::ASCII)
 
-  $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = $wgExe
-  $psi.Arguments = "pubkey"
-  $psi.RedirectStandardInput  = $true
-  $psi.RedirectStandardOutput = $true
-  $psi.RedirectStandardError  = $true
-  $psi.UseShellExecute = $false
-  $psi.CreateNoWindow = $true
+    # cmd.exe handles stdin for wg.exe reliably
+    $cmd = "/c type `"$tmp`" | `"$wgExe`" pubkey"
+    $r = Invoke-ExeCapture -File "cmd.exe" -Args $cmd
+    if ($r.ExitCode -ne 0) { Die "wg pubkey a échoué. $($r.StdErr)" }
 
-  $p = New-Object System.Diagnostics.Process
-  $p.StartInfo = $psi
-  [void]$p.Start()
-
-  # Write ASCII bytes (prevents hidden chars / encoding weirdness)
-  $bytes = [System.Text.Encoding]::ASCII.GetBytes(($PrivKey.Trim()) + "`n")
-  $p.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
-  $p.StandardInput.Close()
-
-  $out = $p.StandardOutput.ReadToEnd()
-  $err = $p.StandardError.ReadToEnd()
-  $p.WaitForExit()
-
-  if ($p.ExitCode -ne 0) {
-    Die "wg pubkey a échoué. $err"
+    $pub = Extract-WgKey $r.StdOut
+    if ([string]::IsNullOrWhiteSpace($pub)) {
+      Die "wg pubkey n'a pas renvoyé une clé valide. Sortie: $($r.StdOut) Erreur: $($r.StdErr)"
+    }
+    return $pub
+  } finally {
+    if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
   }
-
-  $pub = Extract-WgKey $out
-  if ([string]::IsNullOrWhiteSpace($pub)) {
-    Die "wg pubkey n'a pas renvoyé une clé valide. Sortie: $out `nErreur: $err"
-  }
-  return $pub
 }
 
 function New-WgKeyPair([string]$wgExe) {
@@ -183,10 +160,10 @@ function New-WgKeyPair([string]$wgExe) {
 
   $priv = Extract-WgKey $r.StdOut
   if ([string]::IsNullOrWhiteSpace($priv)) {
-    Die "wg genkey n'a pas renvoyé une clé valide. Sortie: $($r.StdOut) `nErreur: $($r.StdErr)"
+    Die "wg genkey n'a pas renvoyé une clé valide. Sortie: $($r.StdOut) Erreur: $($r.StdErr)"
   }
 
-  $pub = Get-WgPubKeyFromPrivAscii -wgExe $wgExe -PrivKey $priv
+  $pub = Get-WgPubKeyFromPriv_File -wgExe $wgExe -PrivKey $priv
   return @{ Private=$priv; Public=$pub }
 }
 
@@ -195,10 +172,7 @@ function Select-FromList([string]$Title, [object[]]$Items, [scriptblock]$Render)
   if ($arr.Length -eq 0) { return $null }
   Write-Host ""
   Write-Host $Title -ForegroundColor Cyan
-  for ($i=0; $i -lt $arr.Length; $i++) {
-    $line = & $Render $arr[$i]
-    Write-Host ("  {0}) {1}" -f ($i+1), $line)
-  }
+  for ($i=0; $i -lt $arr.Length; $i++) { Write-Host ("  {0}) {1}" -f ($i+1), (& $Render $arr[$i])) }
   while ($true) {
     $raw = Read-Host "Choix (1-$($arr.Length))"
     if ($raw -match '^\d+$') {
@@ -236,9 +210,7 @@ function Try-Configure-WinNAT([string]$NatName, [string]$InternalPrefix) {
     if (Read-YesNo "Le supprimer et le recréer ?" "n") {
       Remove-NetNat -Name $NatName -Confirm:$false
       Ok "NAT supprimé."
-    } else {
-      return $true
-    }
+    } else { return $true }
   }
   Info "Création WinNAT: $NatName (Internal=$InternalPrefix)…"
   New-NetNat -Name $NatName -InternalIPInterfaceAddressPrefix $InternalPrefix | Out-Null
@@ -294,12 +266,8 @@ function Install-TunnelService([string]$wireguardExe,[string]$ConfPath,[string]$
 
 function Restart-TunnelService([string]$TunnelName) {
   $svc = "WireGuardTunnel`$$TunnelName"
-  try {
-    Restart-Service -Name $svc -Force
-    Ok "Service redémarré: $svc"
-  } catch {
-    Warn "Impossible de redémarrer $svc automatiquement."
-  }
+  try { Restart-Service -Name $svc -Force; Ok "Service redémarré: $svc" }
+  catch { Warn "Impossible de redémarrer $svc automatiquement." }
 }
 
 function Next-ClientIP([string]$BasePrefix,[int]$Start,[string[]]$Used) {
@@ -324,13 +292,9 @@ $wgExe = $paths.wg
 $wgui  = $paths.wireguard
 Ok "WireGuard présent: $wgui"
 
-$ifcs = Get-NetIPConfiguration | Where-Object {
-  $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq "Up" -and $_.IPv4Address
-}
+$ifcs = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq "Up" -and $_.IPv4Address }
 $pick = if ($ifcs) {
-  Select-FromList "Choisis l'interface WAN (celle qui sort Internet/LAN principal)" $ifcs {
-    param($x) "$($x.InterfaceAlias)  |  $($x.IPv4Address.IPAddress)"
-  }
+  Select-FromList "Choisis l'interface WAN (celle qui sort Internet/LAN principal)" $ifcs { param($x) "$($x.InterfaceAlias)  |  $($x.IPv4Address.IPAddress)" }
 } else { $null }
 $defaultIP = if ($pick) { $pick.IPv4Address.IPAddress } else { "" }
 
@@ -345,9 +309,7 @@ if ($portRaw -notmatch '^\d+$') { Die "Port invalide." }
 $listenPort = [int]$portRaw
 
 $cidr = Read-Default "Réseau WireGuard (CIDR /24 recommandé)" "10.8.0.0/24"
-if ($cidr -notmatch '^(\d{1,3}\.){3}\d{1,3}/24$') {
-  Die "Ce script gère automatiquement /24 uniquement (ex: 10.8.0.0/24)."
-}
+if ($cidr -notmatch '^(\d{1,3}\.){3}\d{1,3}/24$') { Die "Ce script gère automatiquement /24 uniquement (ex: 10.8.0.0/24)." }
 
 $baseIP = $cidr.Split('/')[0]
 $basePrefix = ($baseIP -split '\.')[0..2] -join '.'
@@ -367,9 +329,7 @@ switch ($dnsChoice) {
   "2" { $dns="8.8.8.8" }
   "3" { $dns="9.9.9.9" }
   "4" {
-    $dns = (Get-DnsClientServerAddress -AddressFamily IPv4 |
-      Where-Object { $_.ServerAddresses } |
-      Select-Object -First 1).ServerAddresses[0]
+    $dns = (Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $_.ServerAddresses } | Select-Object -First 1).ServerAddresses[0]
     if ([string]::IsNullOrWhiteSpace($dns)) { $dns="1.1.1.1" }
   }
 }
@@ -380,16 +340,11 @@ Write-Host "  1) Full-tunnel (tout passe dans le VPN)      AllowedIPs=0.0.0.0/0"
 Write-Host "  2) Split-tunnel (réseaux choisis)           AllowedIPs=ex: 10.8.0.0/24,192.168.1.0/24"
 $routeMode = Read-Default "Ton choix" "1"
 $clientAllowed = "0.0.0.0/0"
-if ($routeMode -eq "2") {
-  $clientAllowed = Read-Default "AllowedIPs (séparés par virgules)" "$cidr"
-}
+if ($routeMode -eq "2") { $clientAllowed = Read-Default "AllowedIPs (séparés par virgules)" "$cidr" }
 
 $doNat = $false
-if ($routeMode -eq "1") {
-  $doNat = Read-YesNo "Configurer WinNAT pour que les clients aient Internet via ce serveur ?" "y"
-} else {
-  $doNat = Read-YesNo "Configurer WinNAT quand même ? (rarement utile en split)" "n"
-}
+if ($routeMode -eq "1") { $doNat = Read-YesNo "Configurer WinNAT pour que les clients aient Internet via ce serveur ?" "y" }
+else { $doNat = Read-YesNo "Configurer WinNAT quand même ? (rarement utile en split)" "n" }
 
 Write-Host ""
 Info "Résumé :"
