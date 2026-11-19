@@ -1,8 +1,8 @@
-# WireGuard — Auto-install (Debian/Ubuntu)
+# WireGuard, installation automatique (Debian/Ubuntu)
 
 Script Bash interactif pour installer et configurer un **serveur WireGuard** sur Debian/Ubuntu, avec génération de **profils clients** prêts à importer.
 
-Objectif : tu lances → tu réponds → WireGuard tourne → tu repars avec des fichiers `.conf` (et QR si dispo).
+Le principe : tu lances, tu réponds aux questions, WireGuard tourne et tu repars avec des fichiers `.conf` (et un QR code si possible).
 
 ---
 

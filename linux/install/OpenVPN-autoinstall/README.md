@@ -1,8 +1,8 @@
-# OpenVPN — Auto-install (Debian/Ubuntu)
+# OpenVPN, installation automatique (Debian/Ubuntu)
 
 Script Bash interactif pour installer et configurer un **serveur OpenVPN** sur Debian/Ubuntu, puis générer **un premier profil client `.ovpn`** prêt à importer.
 
-Objectif : tu lances → tu réponds aux questions → le serveur démarre → tu récupères ton fichier client.
+Le principe : tu lances le script, tu réponds aux questions, le serveur démarre et tu récupères ton fichier client.
 
 ---
 
@@ -57,7 +57,7 @@ Le script écrit :
 Inclut :
 - protocole UDP/TCP
 - port
-- réseau VPN (CIDR → converti en masque)
+- réseau VPN (CIDR converti en masque)
 - push de route par défaut (tout le trafic passe dans le VPN)
 - push DNS (Cloudflare/Google/Quad9/OpenDNS ou DNS du serveur)
 - chiffrement (AES-GCM + SHA256 + TLS min 1.2)
@@ -65,7 +65,7 @@ Inclut :
 ### 7) NAT / Firewall (iptables)
 Le script ajoute des règles iptables pour :
 - faire du **NAT** (MASQUERADE) du réseau VPN vers ton interface WAN
-- autoriser le forwarding tun0 ↔ interface WAN
+- autoriser le forwarding entre tun0 et l'interface WAN
 
 Puis sauvegarde les règles via :
 - `netfilter-persistent save`
@@ -96,5 +96,5 @@ Le script génère un fichier client complet (certificat + clé + tls-crypt int�
 
 ### Réseau
 - Si le serveur est derrière une box : il faudra faire une **redirection de port** vers le serveur
-  - ex : UDP 1194 → IP du serveur
+  - ex : UDP 1194 vers l'IP du serveur
 - Si tu utilises un domaine (DuckDNS, etc.) : mets-le comme `REMOTE_HOST`

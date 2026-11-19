@@ -1,38 +1,38 @@
-<h1 align="center">IT Automation Scripts</h1>
-<h3 align="center">PowerShell • Bash • Administration systèmes</h3>
+# it-scripts
 
----
+Mes scripts d'installation pour monter vite un service sur une machine neuve. Je les
+ai écrits pour mon lab, en essayant de les garder assez génériques pour qu'ils
+servent à d'autres.
 
-## 🎯 Objectif
-Ce dépôt regroupe des **scripts d’automatisation orientés administration système**,
-utilisés dans un cadre d’apprentissage et de lab personnel.
+Ils sont interactifs : ils posent des questions, montrent ce qu'ils vont faire et
+demandent confirmation avant les étapes risquées. Lis quand même le script avant
+de le lancer, surtout sur une machine qui compte.
 
-L’objectif est de **gagner du temps**, **standardiser les actions** et
-réduire les erreurs humaines sur des tâches récurrentes.
+## Linux
 
----
+Prévus pour Debian et Ubuntu. Celui de Plex marche aussi sur Fedora, RHEL et
+dérivés.
 
-## 🧠 Domaines couverts
-- Administration Windows et Linux
-- Vérifications systèmes
-- Maintenance de base
-- Scripts d’aide au diagnostic
+| Dossier | Ce que ça installe |
+| :-- | :-- |
+| [linux/install/OpenVPN-autoinstall](linux/install/OpenVPN-autoinstall) | Serveur OpenVPN avec sa PKI Easy-RSA, NAT, et un premier profil client `.ovpn` |
+| [linux/install/Wireguard-autoinstall](linux/install/Wireguard-autoinstall) | Serveur WireGuard, NAT, profils clients `.conf` et QR code |
+| [linux/install/SMB-autoinstall](linux/install/SMB-autoinstall) | Partage Samba sur une partition ou un dossier existant (ou sur un disque vide, avec confirmation) |
+| [linux/install/PlexMediaServer-autoinstall](linux/install/PlexMediaServer-autoinstall) | Plex Media Server depuis le dépôt officiel de Plex (apt ou dnf/yum) |
 
----
+## Windows
 
-## 📁 Organisation
-- `powershell/` : scripts Windows
-- `bash/` : scripts Linux
-- `notes/` : conventions, bonnes pratiques
+| Dossier | Ce que ça installe |
+| :-- | :-- |
+| [windows/install/Wireguard-autoinstall](windows/install/Wireguard-autoinstall) | Serveur WireGuard sur Windows, en PowerShell |
 
----
+## Pour Proxmox
 
-## 🔐 Sécurité
-Aucun mot de passe, clé ou information sensible n’est stocké.
-Tous les scripts sont génériques et adaptables.
+Les scripts propres à Proxmox (post-installation, création de CT, sauvegardes,
+alertes) sont dans un dépôt à part :
+[proxmox-scripts](https://github.com/tom-lion38/proxmox-scripts).
 
----
+## Ce qu'il n'y a pas ici
 
-## 🚀 Évolution
-Le dépôt sera enrichi avec de nouveaux scripts au fur et à mesure
-des besoins et des apprentissages.
+Aucun mot de passe, aucune clé, aucune adresse de mon réseau. Les valeurs que tu
+vois dans les exemples sont génériques, à remplacer par les tiennes.

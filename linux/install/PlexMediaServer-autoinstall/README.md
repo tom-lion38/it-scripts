@@ -1,8 +1,8 @@
-# Plex Media Server — Auto-install (Linux)
+# Plex Media Server, installation automatique (Linux)
 
 Script Bash “one-shot” pour installer **Plex Media Server** proprement et automatiquement sur Linux, puis **démarrer le service** et (optionnel) **ouvrir le port 32400/tcp** sur le firewall.
 
-Objectif : tu lances, tu réponds à 1–2 questions, et tu finis avec Plex accessible via navigateur.
+Le principe : tu lances, tu réponds à une ou deux questions, et Plex est accessible dans le navigateur.
 
 ---
 
@@ -11,8 +11,8 @@ Objectif : tu lances, tu réponds à 1–2 questions, et tu finis avec Plex acce
 ### 1) Détection de la distribution (via gestionnaire de paquets)
 Le script détecte automatiquement comment installer Plex selon ta distro :
 
-- **Debian / Ubuntu** → `apt`
-- **Fedora / RHEL / CentOS / Rocky / Alma** → `dnf` ou `yum`
+- **Debian / Ubuntu** : `apt`
+- **Fedora / RHEL / CentOS / Rocky / Alma** : `dnf` ou `yum`
 
 Si aucun de ces gestionnaires n’est trouvé, le script s’arrête (pour éviter les installations “bancales”).
 
