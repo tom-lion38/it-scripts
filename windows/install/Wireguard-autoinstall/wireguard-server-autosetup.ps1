@@ -364,7 +364,7 @@ switch ($dnsChoice) {
 Write-Host ""
 Write-Host "Mode de routage client :" -ForegroundColor Cyan
 Write-Host "  1) Full-tunnel (tout passe dans le VPN)      AllowedIPs=0.0.0.0/0"
-Write-Host "  2) Split-tunnel (réseaux choisis)           AllowedIPs=ex: 10.8.0.0/24,192.168.1.0/24"
+Write-Host "  2) Split-tunnel (réseaux choisis)           AllowedIPs=ex: 10.8.0.0/24,192.168.10.0/24"
 $routeMode = Read-Default "Ton choix" "1"
 $clientAllowed = "0.0.0.0/0"
 if ($routeMode -eq "2") { $clientAllowed = Read-Default "AllowedIPs (séparés par virgules)" "$cidr" }
